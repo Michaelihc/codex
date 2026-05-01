@@ -81,6 +81,9 @@ use codex_protocol::config_types::SandboxMode;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::ActivePermissionProfileModification;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
@@ -132,6 +135,7 @@ pub use exec_events::TurnStartedEvent;
 pub use exec_events::Usage;
 pub use exec_events::WebSearchItem;
 use serde_json::Value;
+use serde_json::json;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::io::Read;
@@ -1016,10 +1020,86 @@ fn sandbox_mode_from_permission_profile(
 }
 
 fn config_request_overrides_from_config(config: &Config) -> Option<HashMap<String, Value>> {
-    config
-        .active_profile
-        .as_ref()
-        .map(|profile| HashMap::from([("profile".to_string(), Value::String(profile.clone()))]))
+    let mut overrides = HashMap::new();
+    if let Some(profile) = config.active_profile.as_ref() {
+        overrides.insert("profile".to_string(), Value::String(profile.clone()));
+    }
+    add_workspace_write_request_overrides(config, &mut overrides);
+    (!overrides.is_empty()).then_some(overrides)
+}
+
+fn add_workspace_write_request_overrides(config: &Config, overrides: &mut HashMap<String, Value>) {
+    if config.permissions.active_permission_profile().is_some() {
+        return;
+    }
+
+    let permission_profile = config.permissions.permission_profile();
+    let (file_system_policy, network_policy) = permission_profile.to_runtime_permissions();
+    if !has_writable_project_roots_entry(&file_system_policy) {
+        return;
+    }
+
+    let writable_roots = explicit_writable_roots(&file_system_policy);
+    let network_access = network_policy.is_enabled();
+    let exclude_tmpdir_env_var = !has_writable_special_entry(&file_system_policy, |value| {
+        matches!(value, FileSystemSpecialPath::Tmpdir)
+    });
+    let exclude_slash_tmp = !has_writable_special_entry(&file_system_policy, |value| {
+        matches!(value, FileSystemSpecialPath::SlashTmp)
+    });
+    if writable_roots.is_empty() && !network_access && !exclude_tmpdir_env_var && !exclude_slash_tmp
+    {
+        return;
+    }
+
+    overrides.insert(
+        "sandbox_workspace_write".to_string(),
+        json!({
+            "writable_roots": writable_roots,
+            "network_access": network_access,
+            "exclude_tmpdir_env_var": exclude_tmpdir_env_var,
+            "exclude_slash_tmp": exclude_slash_tmp,
+        }),
+    );
+}
+
+fn explicit_writable_roots(file_system_policy: &FileSystemSandboxPolicy) -> Vec<AbsolutePathBuf> {
+    let mut writable_roots = Vec::new();
+    for entry in &file_system_policy.entries {
+        let FileSystemPath::Path { path } = &entry.path else {
+            continue;
+        };
+        if !entry.access.can_write() {
+            continue;
+        }
+        if writable_roots.iter().any(|existing| existing == path) {
+            continue;
+        }
+        writable_roots.push(path.clone());
+    }
+    writable_roots
+}
+
+fn has_writable_project_roots_entry(file_system_policy: &FileSystemSandboxPolicy) -> bool {
+    has_writable_special_entry(file_system_policy, |value| {
+        matches!(
+            value,
+            FileSystemSpecialPath::ProjectRoots { subpath } if subpath.is_none()
+        )
+    })
+}
+
+fn has_writable_special_entry(
+    file_system_policy: &FileSystemSandboxPolicy,
+    matches_special_path: impl Fn(&FileSystemSpecialPath) -> bool,
+) -> bool {
+    file_system_policy.entries.iter().any(|entry| {
+        entry.access.can_write()
+            && matches!(
+                &entry.path,
+                FileSystemPath::Special { value } if matches_special_path(value)
+            )
+    })
 }
 
 fn approvals_reviewer_override_from_config(

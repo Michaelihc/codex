@@ -422,6 +422,68 @@ async fn thread_lifecycle_params_include_legacy_sandbox_when_no_active_profile()
     assert_eq!(resume_params.permissions, None);
 }
 
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn thread_lifecycle_params_preserve_workspace_write_roots() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let workspace = tempdir().expect("create temp workspace");
+    let frontend = workspace.path().join("frontend");
+    let backend = workspace.path().join("backend");
+    std::fs::create_dir_all(&frontend).expect("create frontend dir");
+    std::fs::create_dir_all(&backend).expect("create backend dir");
+
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .harness_overrides(ConfigOverrides {
+            cwd: Some(frontend),
+            sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+            additional_writable_roots: vec![backend.clone()],
+            ..Default::default()
+        })
+        .build()
+        .await
+        .expect("build config with workspace-write root");
+
+    let start_params = thread_start_params_from_config(&config);
+    let resume_params = thread_resume_params_from_config(&config, "thread-id".to_string());
+    let expected_backend = backend.abs().as_path().to_string_lossy().into_owned();
+
+    for config_overrides in [
+        start_params
+            .config
+            .as_ref()
+            .expect("start config overrides"),
+        resume_params
+            .config
+            .as_ref()
+            .expect("resume config overrides"),
+    ] {
+        let sandbox_workspace_write = config_overrides
+            .get("sandbox_workspace_write")
+            .expect("sandbox workspace-write overrides");
+        let writable_roots = sandbox_workspace_write
+            .get("writable_roots")
+            .and_then(serde_json::Value::as_array)
+            .expect("writable roots array");
+        assert!(
+            writable_roots
+                .iter()
+                .any(|root| root.as_str() == Some(expected_backend.as_str())),
+            "expected writable_roots to include {expected_backend}, got {writable_roots:?}"
+        );
+    }
+    assert_eq!(
+        start_params.sandbox,
+        Some(codex_app_server_protocol::SandboxMode::WorkspaceWrite)
+    );
+    assert_eq!(start_params.permissions, None);
+    assert_eq!(
+        resume_params.sandbox,
+        Some(codex_app_server_protocol::SandboxMode::WorkspaceWrite)
+    );
+    assert_eq!(resume_params.permissions, None);
+}
+
 #[tokio::test]
 async fn session_configured_from_thread_response_uses_review_policy_from_response() {
     let codex_home = tempdir().expect("create temp codex home");
