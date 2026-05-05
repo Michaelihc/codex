@@ -1127,12 +1127,11 @@ impl ModelClientSession {
 
         let mut tool_mappings = HashMap::new();
         let tools = Self::create_chat_tools(&prompt.tools, &mut tool_mappings)?;
-        let thinking = Self::chat_thinking_for_model(&model_info.slug);
+        let selected_effort = effort.or(model_info.default_reasoning_level);
+        let thinking = Self::chat_thinking_for_model(&model_info.slug, selected_effort);
         let reasoning_effort =
             if matches!(thinking.as_ref().map(|value| value.r#type), Some("enabled")) {
-                Some(Self::chat_reasoning_effort(
-                    effort.or(model_info.default_reasoning_level),
-                ))
+                Some(Self::chat_reasoning_effort(selected_effort))
             } else {
                 None
             };
@@ -1465,10 +1464,19 @@ impl ModelClientSession {
             .unwrap_or_else(|| arguments.to_string())
     }
 
-    fn chat_thinking_for_model(model_slug: &str) -> Option<ChatThinking> {
+    fn chat_thinking_for_model(
+        model_slug: &str,
+        effort: Option<ReasoningEffortConfig>,
+    ) -> Option<ChatThinking> {
         match model_slug {
-            "deepseek-v4-flash" | "deepseek-chat" => Some(ChatThinking { r#type: "disabled" }),
-            "deepseek-v4-pro" | "deepseek-reasoner" => Some(ChatThinking { r#type: "enabled" }),
+            "deepseek-v4-flash" | "deepseek-chat" | "deepseek-v4-pro" | "deepseek-reasoner" => {
+                let r#type = if matches!(effort, Some(ReasoningEffortConfig::None)) {
+                    "disabled"
+                } else {
+                    "enabled"
+                };
+                Some(ChatThinking { r#type })
+            }
             _ => None,
         }
     }

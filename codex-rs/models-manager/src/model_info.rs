@@ -114,25 +114,13 @@ fn deepseek_model_info(slug: &str) -> Option<ModelInfo> {
                 "DeepSeek V4 Flash",
                 "Lower-latency DeepSeek V4 model for everyday coding work.",
                 Some(ReasoningEffort::None),
-                vec![ReasoningEffortPreset {
-                    effort: ReasoningEffort::None,
-                    description: "Thinking disabled".to_string(),
-                }],
+                deepseek_reasoning_efforts(),
             ),
             "deepseek-v4-pro" | "deepseek-reasoner" => (
                 "DeepSeek V4 Pro",
                 "DeepSeek V4 model with thinking mode for harder coding tasks.",
                 Some(ReasoningEffort::High),
-                vec![
-                    ReasoningEffortPreset {
-                        effort: ReasoningEffort::High,
-                        description: "Thinking mode".to_string(),
-                    },
-                    ReasoningEffortPreset {
-                        effort: ReasoningEffort::XHigh,
-                        description: "Maximum thinking mode".to_string(),
-                    },
-                ],
+                deepseek_reasoning_efforts(),
             ),
             _ => return None,
         };
@@ -170,6 +158,23 @@ fn deepseek_model_info(slug: &str) -> Option<ModelInfo> {
         used_fallback_model_metadata: false,
         supports_search_tool: false,
     })
+}
+
+fn deepseek_reasoning_efforts() -> Vec<ReasoningEffortPreset> {
+    vec![
+        ReasoningEffortPreset {
+            effort: ReasoningEffort::None,
+            description: "Thinking disabled".to_string(),
+        },
+        ReasoningEffortPreset {
+            effort: ReasoningEffort::High,
+            description: "Thinking mode".to_string(),
+        },
+        ReasoningEffortPreset {
+            effort: ReasoningEffort::XHigh,
+            description: "Maximum thinking mode".to_string(),
+        },
+    ]
 }
 
 fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {

@@ -181,6 +181,12 @@ impl ChatWidget {
                 self.open_provider_popup();
             }
             SlashCommand::Fast => {
+                if self.config.model_provider_id == "deepseek" {
+                    self.add_error_message(
+                        "/fast is unavailable for DeepSeek providers.".to_string(),
+                    );
+                    return;
+                }
                 let next_tier = if matches!(self.current_service_tier(), Some(ServiceTier::Fast)) {
                     None
                 } else {
