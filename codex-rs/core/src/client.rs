@@ -74,16 +74,23 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::MessagePhase;
+use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout_trace::CompactionTraceContext;
 use codex_rollout_trace::InferenceTraceAttempt;
 use codex_rollout_trace::InferenceTraceContext;
+use codex_tools::ResponsesApiNamespaceTool;
+use codex_tools::ResponsesApiTool;
+use codex_tools::ToolSpec;
 use codex_tools::create_tools_json_for_responses_api;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
@@ -92,6 +99,9 @@ use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use http::StatusCode as HttpStatusCode;
 use reqwest::StatusCode;
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Value;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -144,6 +154,95 @@ const MEMORIES_SUMMARIZE_ENDPOINT: &str = "/memories/trace_summarize";
 #[cfg(test)]
 pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS);
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ChatThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
+    stream: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatThinking {
+    r#type: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatMessage {
+    role: String,
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ChatToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ChatToolCall {
+    id: String,
+    r#type: String,
+    function: ChatToolCallFunction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ChatToolCallFunction {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionResponse {
+    id: String,
+    choices: Vec<ChatCompletionChoice>,
+    usage: Option<ChatCompletionUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionChoice {
+    message: ChatCompletionMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionMessage {
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    tool_calls: Option<Vec<ChatToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionUsage {
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    prompt_cache_hit_tokens: Option<i64>,
+    completion_tokens_details: Option<ChatCompletionTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionTokensDetails {
+    reasoning_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+enum ChatToolMapping {
+    Function {
+        namespace: Option<String>,
+        name: String,
+    },
+    Freeform {
+        name: String,
+    },
+}
 
 /// Session-scoped state shared by all [`ModelClient`] clones.
 ///
@@ -904,6 +1003,587 @@ impl ModelClientSession {
         Ok(request)
     }
 
+    fn build_chat_completion_request(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        effort: Option<ReasoningEffortConfig>,
+    ) -> Result<(ChatCompletionRequest, HashMap<String, ChatToolMapping>)> {
+        let mut messages = Vec::new();
+        let instructions = prompt.base_instructions.text.trim();
+        if !instructions.is_empty() {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(instructions.to_string()),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+
+        let mut pending_reasoning_content: Option<String> = None;
+        let mut pending_tool_calls: Vec<ChatToolCall> = Vec::new();
+        let mut pending_tool_call_reasoning: Option<String> = None;
+        let mut expected_tool_outputs: Vec<String> = Vec::new();
+        for item in prompt.get_formatted_input() {
+            if let ResponseItem::Reasoning {
+                summary, content, ..
+            } = &item
+            {
+                pending_reasoning_content =
+                    Self::chat_reasoning_content_from_response_item(summary, content.as_deref());
+                continue;
+            }
+
+            match item {
+                ResponseItem::FunctionCall {
+                    name,
+                    namespace,
+                    arguments,
+                    call_id,
+                    ..
+                } => {
+                    Self::append_missing_chat_tool_outputs(
+                        &mut messages,
+                        &mut expected_tool_outputs,
+                    );
+                    if pending_tool_call_reasoning.is_none() {
+                        pending_tool_call_reasoning = pending_reasoning_content.take();
+                    }
+                    pending_tool_calls.push(ChatToolCall {
+                        id: call_id,
+                        r#type: "function".to_string(),
+                        function: ChatToolCallFunction {
+                            name: Self::chat_wire_tool_name(namespace.as_deref(), &name),
+                            arguments,
+                        },
+                    });
+                }
+                ResponseItem::CustomToolCall {
+                    name,
+                    input,
+                    call_id,
+                    ..
+                } => {
+                    Self::append_missing_chat_tool_outputs(
+                        &mut messages,
+                        &mut expected_tool_outputs,
+                    );
+                    if pending_tool_call_reasoning.is_none() {
+                        pending_tool_call_reasoning = pending_reasoning_content.take();
+                    }
+                    pending_tool_calls.push(ChatToolCall {
+                        id: call_id,
+                        r#type: "function".to_string(),
+                        function: ChatToolCallFunction {
+                            name,
+                            arguments: Self::chat_freeform_arguments(&input),
+                        },
+                    });
+                }
+                ResponseItem::FunctionCallOutput { call_id, output }
+                | ResponseItem::CustomToolCallOutput {
+                    call_id, output, ..
+                } => {
+                    Self::append_pending_chat_tool_calls(
+                        &mut messages,
+                        &mut pending_tool_calls,
+                        &mut pending_tool_call_reasoning,
+                        &mut expected_tool_outputs,
+                    );
+                    Self::append_chat_tool_output_message(
+                        &mut messages,
+                        &mut expected_tool_outputs,
+                        call_id,
+                        output.to_string(),
+                    );
+                }
+                item => {
+                    Self::append_pending_chat_tool_calls(
+                        &mut messages,
+                        &mut pending_tool_calls,
+                        &mut pending_tool_call_reasoning,
+                        &mut expected_tool_outputs,
+                    );
+                    Self::append_missing_chat_tool_outputs(
+                        &mut messages,
+                        &mut expected_tool_outputs,
+                    );
+                    Self::append_chat_message_for_response_item(
+                        &mut messages,
+                        item,
+                        pending_reasoning_content.take(),
+                    );
+                }
+            }
+        }
+        Self::append_pending_chat_tool_calls(
+            &mut messages,
+            &mut pending_tool_calls,
+            &mut pending_tool_call_reasoning,
+            &mut expected_tool_outputs,
+        );
+        Self::append_missing_chat_tool_outputs(&mut messages, &mut expected_tool_outputs);
+
+        let mut tool_mappings = HashMap::new();
+        let tools = Self::create_chat_tools(&prompt.tools, &mut tool_mappings)?;
+        let thinking = Self::chat_thinking_for_model(&model_info.slug);
+        let reasoning_effort =
+            if matches!(thinking.as_ref().map(|value| value.r#type), Some("enabled")) {
+                Some(Self::chat_reasoning_effort(
+                    effort.or(model_info.default_reasoning_level),
+                ))
+            } else {
+                None
+            };
+
+        Ok((
+            ChatCompletionRequest {
+                model: model_info.slug.clone(),
+                messages,
+                thinking,
+                reasoning_effort,
+                tool_choice: (!tools.is_empty()).then_some("auto"),
+                tools,
+                stream: false,
+            },
+            tool_mappings,
+        ))
+    }
+
+    fn append_chat_message_for_response_item(
+        messages: &mut Vec<ChatMessage>,
+        item: ResponseItem,
+        reasoning_content: Option<String>,
+    ) {
+        match item {
+            ResponseItem::Message { role, content, .. } => {
+                let content = Self::chat_text_from_content(&content);
+                if content.trim().is_empty() {
+                    return;
+                }
+                messages.push(ChatMessage {
+                    role: Self::chat_role(&role).to_string(),
+                    content: Some(content),
+                    reasoning_content: (role == "assistant").then_some(reasoning_content).flatten(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+            ResponseItem::FunctionCall {
+                name,
+                namespace,
+                arguments,
+                call_id,
+                ..
+            } => {
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    reasoning_content,
+                    tool_calls: Some(vec![ChatToolCall {
+                        id: call_id,
+                        r#type: "function".to_string(),
+                        function: ChatToolCallFunction {
+                            name: Self::chat_wire_tool_name(namespace.as_deref(), &name),
+                            arguments,
+                        },
+                    }]),
+                    tool_call_id: None,
+                });
+            }
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(output.to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: Some(call_id),
+                });
+            }
+            ResponseItem::CustomToolCall {
+                name,
+                input,
+                call_id,
+                ..
+            } => {
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    reasoning_content,
+                    tool_calls: Some(vec![ChatToolCall {
+                        id: call_id,
+                        r#type: "function".to_string(),
+                        function: ChatToolCallFunction {
+                            name,
+                            arguments: Self::chat_freeform_arguments(&input),
+                        },
+                    }]),
+                    tool_call_id: None,
+                });
+            }
+            ResponseItem::CustomToolCallOutput {
+                call_id, output, ..
+            } => {
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(output.to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: Some(call_id),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn append_pending_chat_tool_calls(
+        messages: &mut Vec<ChatMessage>,
+        pending_tool_calls: &mut Vec<ChatToolCall>,
+        pending_tool_call_reasoning: &mut Option<String>,
+        expected_tool_outputs: &mut Vec<String>,
+    ) {
+        if pending_tool_calls.is_empty() {
+            return;
+        }
+        expected_tool_outputs.extend(
+            pending_tool_calls
+                .iter()
+                .map(|tool_call| tool_call.id.clone()),
+        );
+        messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            reasoning_content: pending_tool_call_reasoning.take(),
+            tool_calls: Some(std::mem::take(pending_tool_calls)),
+            tool_call_id: None,
+        });
+    }
+
+    fn append_chat_tool_output_message(
+        messages: &mut Vec<ChatMessage>,
+        expected_tool_outputs: &mut Vec<String>,
+        call_id: String,
+        output: String,
+    ) {
+        let Some(index) = expected_tool_outputs
+            .iter()
+            .position(|expected| expected == &call_id)
+        else {
+            return;
+        };
+        expected_tool_outputs.remove(index);
+        messages.push(ChatMessage {
+            role: "tool".to_string(),
+            content: Some(output),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: Some(call_id),
+        });
+    }
+
+    fn append_missing_chat_tool_outputs(
+        messages: &mut Vec<ChatMessage>,
+        expected_tool_outputs: &mut Vec<String>,
+    ) {
+        for call_id in std::mem::take(expected_tool_outputs) {
+            messages.push(ChatMessage {
+                role: "tool".to_string(),
+                content: Some("Tool call did not produce output.".to_string()),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some(call_id),
+            });
+        }
+    }
+
+    fn chat_reasoning_content_from_response_item(
+        summary: &[codex_protocol::models::ReasoningItemReasoningSummary],
+        content: Option<&[ReasoningItemContent]>,
+    ) -> Option<String> {
+        let raw = content
+            .into_iter()
+            .flatten()
+            .map(|entry| match entry {
+                ReasoningItemContent::ReasoningText { text }
+                | ReasoningItemContent::Text { text } => text.as_str(),
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        if !raw.trim().is_empty() {
+            return Some(raw);
+        }
+
+        let summary = summary
+            .iter()
+            .map(|entry| match entry {
+                codex_protocol::models::ReasoningItemReasoningSummary::SummaryText { text } => {
+                    text.as_str()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        (!summary.trim().is_empty()).then_some(summary)
+    }
+
+    fn chat_role(role: &str) -> &str {
+        match role {
+            "assistant" => "assistant",
+            "system" | "developer" => "system",
+            _ => "user",
+        }
+    }
+
+    fn chat_text_from_content(content: &[ContentItem]) -> String {
+        content
+            .iter()
+            .filter_map(|item| match item {
+                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                    Some(text.as_str())
+                }
+                ContentItem::InputImage { .. } => Some("[image input omitted]"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn create_chat_tools(
+        tools: &[ToolSpec],
+        tool_mappings: &mut HashMap<String, ChatToolMapping>,
+    ) -> Result<Vec<Value>> {
+        let mut chat_tools = Vec::new();
+        for tool in tools {
+            match tool {
+                ToolSpec::Function(tool) => {
+                    let wire_name = Self::chat_wire_tool_name(None, &tool.name);
+                    tool_mappings.insert(
+                        wire_name.clone(),
+                        ChatToolMapping::Function {
+                            namespace: None,
+                            name: tool.name.clone(),
+                        },
+                    );
+                    chat_tools.push(Self::chat_function_tool_value(&wire_name, tool)?);
+                }
+                ToolSpec::Namespace(namespace) => {
+                    for tool in &namespace.tools {
+                        let ResponsesApiNamespaceTool::Function(tool) = tool;
+                        let wire_name =
+                            Self::chat_wire_tool_name(Some(&namespace.name), &tool.name);
+                        tool_mappings.insert(
+                            wire_name.clone(),
+                            ChatToolMapping::Function {
+                                namespace: Some(namespace.name.clone()),
+                                name: tool.name.clone(),
+                            },
+                        );
+                        chat_tools.push(Self::chat_function_tool_value(&wire_name, tool)?);
+                    }
+                }
+                ToolSpec::Freeform(tool) => {
+                    let wire_name = Self::chat_wire_tool_name(None, &tool.name);
+                    tool_mappings.insert(
+                        wire_name.clone(),
+                        ChatToolMapping::Freeform {
+                            name: tool.name.clone(),
+                        },
+                    );
+                    chat_tools.push(serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": wire_name,
+                            "description": tool.description,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "input": {
+                                        "type": "string",
+                                        "description": format!(
+                                            "Freeform input using {} syntax.\n{}",
+                                            tool.format.syntax, tool.format.definition
+                                        ),
+                                    }
+                                },
+                                "required": ["input"],
+                                "additionalProperties": false
+                            }
+                        }
+                    }));
+                }
+                ToolSpec::ToolSearch { .. }
+                | ToolSpec::LocalShell {}
+                | ToolSpec::ImageGeneration { .. }
+                | ToolSpec::WebSearch { .. } => {}
+            }
+        }
+        Ok(chat_tools)
+    }
+
+    fn chat_function_tool_value(wire_name: &str, tool: &ResponsesApiTool) -> Result<Value> {
+        let parameters = serde_json::to_value(&tool.parameters)?;
+        Ok(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": wire_name,
+                "description": tool.description,
+                "parameters": parameters
+            }
+        }))
+    }
+
+    fn chat_wire_tool_name(namespace: Option<&str>, name: &str) -> String {
+        let raw_name = match namespace {
+            Some(namespace) => format!("{namespace}__{name}"),
+            None => name.to_string(),
+        };
+        raw_name
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .take(64)
+            .collect()
+    }
+
+    fn chat_freeform_arguments(input: &str) -> String {
+        serde_json::json!({ "input": input }).to_string()
+    }
+
+    fn chat_freeform_input_from_arguments(arguments: &str) -> String {
+        serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| arguments.to_string())
+    }
+
+    fn chat_thinking_for_model(model_slug: &str) -> Option<ChatThinking> {
+        match model_slug {
+            "deepseek-v4-flash" | "deepseek-chat" => Some(ChatThinking { r#type: "disabled" }),
+            "deepseek-v4-pro" | "deepseek-reasoner" => Some(ChatThinking { r#type: "enabled" }),
+            _ => None,
+        }
+    }
+
+    fn chat_reasoning_effort(effort: Option<ReasoningEffortConfig>) -> &'static str {
+        match effort.unwrap_or(ReasoningEffortConfig::High) {
+            ReasoningEffortConfig::XHigh => "max",
+            ReasoningEffortConfig::None
+            | ReasoningEffortConfig::Minimal
+            | ReasoningEffortConfig::Low
+            | ReasoningEffortConfig::Medium
+            | ReasoningEffortConfig::High => "high",
+        }
+    }
+
+    fn token_usage_from_chat_usage(usage: Option<ChatCompletionUsage>) -> Option<TokenUsage> {
+        usage.map(|usage| TokenUsage {
+            input_tokens: usage.prompt_tokens.unwrap_or_default(),
+            cached_input_tokens: usage.prompt_cache_hit_tokens.unwrap_or_default(),
+            output_tokens: usage.completion_tokens.unwrap_or_default(),
+            reasoning_output_tokens: usage
+                .completion_tokens_details
+                .and_then(|details| details.reasoning_tokens)
+                .unwrap_or_default(),
+            total_tokens: usage.total_tokens.unwrap_or_default(),
+        })
+    }
+
+    fn response_items_from_chat_message(
+        message: ChatCompletionMessage,
+        tool_mappings: &HashMap<String, ChatToolMapping>,
+        response_id: &str,
+    ) -> (Vec<ResponseItem>, Option<bool>) {
+        if let Some(tool_calls) = message.tool_calls
+            && !tool_calls.is_empty()
+        {
+            let mut items = Vec::new();
+            if let Some(reasoning_content) = message.reasoning_content
+                && !reasoning_content.trim().is_empty()
+            {
+                items.push(ResponseItem::Reasoning {
+                    id: format!("rs_{response_id}"),
+                    summary: Vec::new(),
+                    content: Some(vec![ReasoningItemContent::ReasoningText {
+                        text: reasoning_content,
+                    }]),
+                    encrypted_content: None,
+                });
+            }
+            for tool_call in tool_calls {
+                match tool_mappings.get(&tool_call.function.name) {
+                    Some(ChatToolMapping::Function { namespace, name }) => {
+                        items.push(ResponseItem::FunctionCall {
+                            id: Some(tool_call.id.clone()),
+                            name: name.clone(),
+                            namespace: namespace.clone(),
+                            arguments: tool_call.function.arguments,
+                            call_id: tool_call.id,
+                        });
+                    }
+                    Some(ChatToolMapping::Freeform { name }) => {
+                        items.push(ResponseItem::CustomToolCall {
+                            id: Some(tool_call.id.clone()),
+                            status: None,
+                            call_id: tool_call.id,
+                            name: name.clone(),
+                            input: Self::chat_freeform_input_from_arguments(
+                                &tool_call.function.arguments,
+                            ),
+                        });
+                    }
+                    None => {
+                        items.push(ResponseItem::FunctionCall {
+                            id: Some(tool_call.id.clone()),
+                            name: tool_call.function.name,
+                            namespace: None,
+                            arguments: tool_call.function.arguments,
+                            call_id: tool_call.id,
+                        });
+                    }
+                }
+            }
+            return (items, Some(false));
+        }
+
+        let Some(content) = message.content else {
+            return (Vec::new(), Some(true));
+        };
+        if content.is_empty() && message.reasoning_content.is_none() {
+            return (Vec::new(), Some(true));
+        }
+        let mut items = Vec::new();
+        if let Some(reasoning_content) = message.reasoning_content
+            && !reasoning_content.trim().is_empty()
+        {
+            items.push(ResponseItem::Reasoning {
+                id: format!("rs_{response_id}"),
+                summary: Vec::new(),
+                content: Some(vec![ReasoningItemContent::ReasoningText {
+                    text: reasoning_content,
+                }]),
+                encrypted_content: None,
+            });
+        }
+        if !content.is_empty() {
+            items.push(ResponseItem::Message {
+                id: Some(format!("msg_{response_id}")),
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText { text: content }],
+                phase: Some(MessagePhase::FinalAnswer),
+            });
+        }
+        (items, Some(true))
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// Builds shared Responses API transport options and request-body options.
     ///
@@ -1266,6 +1946,105 @@ impl ModelClientSession {
         }
     }
 
+    #[instrument(
+        name = "model_client.stream_chat_completions",
+        level = "info",
+        skip_all,
+        fields(
+            model = %model_info.slug,
+            wire_api = %self.client.state.provider.info().wire_api,
+            transport = "chat_http",
+            http.method = "POST",
+            api.path = "chat/completions"
+        )
+    )]
+    async fn stream_chat_completions(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+    ) -> Result<ResponseStream> {
+        let client_setup = self.client.current_client_setup().await?;
+        let (request, tool_mappings) =
+            self.build_chat_completion_request(prompt, model_info, effort)?;
+        let url = client_setup.api_provider.url_for_path("chat/completions");
+        let mut headers = client_setup.api_provider.headers.clone();
+        client_setup.api_auth.add_auth_headers(&mut headers);
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let response = build_reqwest_client()
+            .post(url.clone())
+            .headers(headers)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|err| CodexErr::Fatal(format!("chat completion request failed: {err}")))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| CodexErr::Fatal(format!("chat completion body read failed: {err}")))?;
+        if !status.is_success() {
+            return Err(CodexErr::Fatal(format!(
+                "chat completion failed with HTTP {status}: {body}"
+            )));
+        }
+
+        let chat_response: ChatCompletionResponse = serde_json::from_str(&body)?;
+        let ChatCompletionResponse {
+            id: response_id,
+            choices,
+            usage,
+        } = chat_response;
+        let choice = choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| CodexErr::Fatal("chat completion returned no choices".to_string()))?;
+        let token_usage = Self::token_usage_from_chat_usage(usage);
+        if let Some(usage) = &token_usage {
+            session_telemetry.sse_event_completed(
+                usage.input_tokens,
+                usage.output_tokens,
+                Some(usage.cached_input_tokens),
+                Some(usage.reasoning_output_tokens),
+                usage.total_tokens,
+            );
+        }
+        let (items, end_turn) =
+            Self::response_items_from_chat_message(choice.message, &tool_mappings, &response_id);
+
+        let (tx_event, rx_event) =
+            mpsc::channel::<Result<ResponseEvent>>(RESPONSE_STREAM_CHANNEL_CAPACITY);
+        let consumer_dropped = CancellationToken::new();
+        tokio::spawn(async move {
+            if tx_event.send(Ok(ResponseEvent::Created)).await.is_err() {
+                return;
+            }
+            for item in items {
+                if tx_event
+                    .send(Ok(ResponseEvent::OutputItemDone(item)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let _ = tx_event
+                .send(Ok(ResponseEvent::Completed {
+                    response_id,
+                    token_usage,
+                    end_turn,
+                }))
+                .await;
+        });
+
+        Ok(ResponseStream {
+            rx_event,
+            consumer_dropped,
+        })
+    }
+
     /// Streams a turn via the Responses API over WebSocket transport.
     #[allow(clippy::too_many_arguments)]
     #[instrument(
@@ -1551,6 +2330,10 @@ impl ModelClientSession {
                     inference_trace,
                 )
                 .await
+            }
+            WireApi::Chat => {
+                self.stream_chat_completions(prompt, model_info, session_telemetry, effort)
+                    .await
             }
         }
     }

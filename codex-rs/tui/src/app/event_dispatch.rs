@@ -707,7 +707,72 @@ impl App {
                 self.on_update_reasoning_effort(effort);
             }
             AppEvent::UpdateModel(model) => {
+                self.config.model = Some(model.clone());
                 self.chat_widget.set_model(&model);
+            }
+            AppEvent::SelectProvider { provider_id } => {
+                if !self.chat_widget.can_switch_provider() {
+                    self.chat_widget.add_error_message(
+                        "/provider can only be used before the first turn in a thread. Start a new thread to change providers.".to_string(),
+                    );
+                    return Ok(AppRunControl::Continue);
+                }
+
+                let provider_info = match self.config.model_providers.get(&provider_id).cloned() {
+                    Some(provider_info) => provider_info,
+                    None => {
+                        self.chat_widget
+                            .add_error_message(format!("Unknown model provider `{provider_id}`."));
+                        return Ok(AppRunControl::Continue);
+                    }
+                };
+                let provider_default_model = match provider_id.as_str() {
+                    "deepseek" => Some("deepseek-v4-flash"),
+                    _ => None,
+                };
+                let profile = self.active_profile.as_deref();
+                let mut edits = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_profile(profile)
+                    .set_model_provider(&provider_id);
+                if let Some(model) = provider_default_model {
+                    edits = edits.set_model(Some(model), None);
+                }
+                match edits.apply().await {
+                    Ok(()) => {
+                        self.config.model_provider_id = provider_id.clone();
+                        self.config.model_provider = provider_info;
+                        if let Some(model) = provider_default_model {
+                            self.config.model = Some(model.to_string());
+                            self.config.model_reasoning_effort = None;
+                            self.chat_widget.set_model(model);
+                            self.on_update_reasoning_effort(None);
+                        }
+                        self.start_fresh_session_with_summary_hint(
+                            tui,
+                            app_server,
+                            Some(ThreadStartSource::Clear),
+                            /*initial_user_message*/ None,
+                        )
+                        .await;
+                        self.chat_widget.add_info_message(
+                            match provider_default_model {
+                                Some(model) => {
+                                    format!("Provider changed to {provider_id} with model {model}.")
+                                }
+                                None => format!("Provider changed to {provider_id}."),
+                            },
+                            Some(
+                                "Use /model to choose another model exposed by this provider."
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to save model provider `{provider_id}`: {err}"
+                        ));
+                    }
+                }
             }
             AppEvent::UpdateCollaborationMode(mask) => {
                 self.chat_widget.set_collaboration_mask(mask);

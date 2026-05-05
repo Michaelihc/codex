@@ -619,14 +619,15 @@ pub struct Config {
     /// Memories subsystem settings.
     pub memories: MemoriesConfig,
 
-    /// Directory containing all Codex state (defaults to `~/.codex` but can be
-    /// overridden by the `CODEX_HOME` environment variable).
+    /// Directory containing all Codex Multi state (defaults to `~/.codex-multi`
+    /// but can be overridden by the `CODEX_MULTI_HOME` environment variable).
     pub codex_home: AbsolutePathBuf,
 
     /// Directory where Codex stores the SQLite state DB.
     pub sqlite_home: PathBuf,
 
-    /// Directory where Codex writes log files (defaults to `$CODEX_HOME/log`).
+    /// Directory where Codex Multi writes log files (defaults to
+    /// `$CODEX_MULTI_HOME/log`).
     pub log_dir: PathBuf,
 
     /// Directory where Codex writes effective session config lock files.
@@ -643,7 +644,8 @@ pub struct Config {
     /// Effective config lock used for strict replay validation.
     pub config_lock_toml: Option<Arc<ConfigLockfileToml>>,
 
-    /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
+    /// Settings that govern if and what will be written to
+    /// `~/.codex-multi/history.jsonl`.
     pub history: History,
 
     /// When true, session is not persisted on disk. Default to `false`

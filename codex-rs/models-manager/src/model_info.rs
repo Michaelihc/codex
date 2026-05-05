@@ -1,9 +1,12 @@
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelInstructionsVariables;
 use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::openai_models::ModelVisibility;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::openai_models::TruncationMode;
 use codex_protocol::openai_models::TruncationPolicyConfig;
 use codex_protocol::openai_models::WebSearchToolType;
@@ -64,6 +67,10 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
 
 /// Build a minimal fallback model descriptor for missing/unknown slugs.
 pub fn model_info_from_slug(slug: &str) -> ModelInfo {
+    if let Some(model_info) = deepseek_model_info(slug) {
+        return model_info;
+    }
+
     warn!("Unknown model {slug} is used. This will use fallback model metadata.");
     ModelInfo {
         slug: slug.to_string(),
@@ -98,6 +105,71 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         used_fallback_model_metadata: true, // this is the fallback model metadata
         supports_search_tool: false,
     }
+}
+
+fn deepseek_model_info(slug: &str) -> Option<ModelInfo> {
+    let (display_name, description, default_reasoning_level, supported_reasoning_levels) =
+        match slug {
+            "deepseek-v4-flash" | "deepseek-chat" => (
+                "DeepSeek V4 Flash",
+                "Lower-latency DeepSeek V4 model for everyday coding work.",
+                Some(ReasoningEffort::None),
+                vec![ReasoningEffortPreset {
+                    effort: ReasoningEffort::None,
+                    description: "Thinking disabled".to_string(),
+                }],
+            ),
+            "deepseek-v4-pro" | "deepseek-reasoner" => (
+                "DeepSeek V4 Pro",
+                "DeepSeek V4 model with thinking mode for harder coding tasks.",
+                Some(ReasoningEffort::High),
+                vec![
+                    ReasoningEffortPreset {
+                        effort: ReasoningEffort::High,
+                        description: "Thinking mode".to_string(),
+                    },
+                    ReasoningEffortPreset {
+                        effort: ReasoningEffort::XHigh,
+                        description: "Maximum thinking mode".to_string(),
+                    },
+                ],
+            ),
+            _ => return None,
+        };
+
+    Some(ModelInfo {
+        slug: slug.to_string(),
+        display_name: display_name.to_string(),
+        description: Some(description.to_string()),
+        default_reasoning_level,
+        supported_reasoning_levels,
+        shell_type: ConfigShellToolType::Default,
+        visibility: ModelVisibility::List,
+        supported_in_api: true,
+        priority: 50,
+        additional_speed_tiers: Vec::new(),
+        availability_nux: None,
+        upgrade: None,
+        base_instructions: BASE_INSTRUCTIONS.to_string(),
+        model_messages: None,
+        supports_reasoning_summaries: false,
+        default_reasoning_summary: ReasoningSummary::None,
+        support_verbosity: false,
+        default_verbosity: None,
+        apply_patch_tool_type: Some(ApplyPatchToolType::Freeform),
+        web_search_tool_type: WebSearchToolType::Text,
+        truncation_policy: TruncationPolicyConfig::tokens(/*limit*/ 10_000),
+        supports_parallel_tool_calls: false,
+        supports_image_detail_original: false,
+        context_window: Some(1_000_000),
+        max_context_window: Some(1_000_000),
+        auto_compact_token_limit: None,
+        effective_context_window_percent: 95,
+        experimental_supported_tools: Vec::new(),
+        input_modalities: vec![codex_protocol::openai_models::InputModality::Text],
+        used_fallback_model_metadata: false,
+        supports_search_tool: false,
+    })
 }
 
 fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {

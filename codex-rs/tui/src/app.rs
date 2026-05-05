@@ -567,6 +567,10 @@ impl App {
         cfg: crate::legacy_core::config::Config,
         initial_user_message: Option<crate::chatwidget::UserMessage>,
     ) -> crate::chatwidget::ChatWidgetInit {
+        let model = cfg
+            .model
+            .clone()
+            .unwrap_or_else(|| self.chat_widget.current_model().to_string());
         crate::chatwidget::ChatWidgetInit {
             config: cfg,
             frame_requester: tui.frame_requester(),
@@ -583,7 +587,7 @@ impl App {
                 .runtime_model_provider_base_url()
                 .map(str::to_string),
             initial_plan_type: self.chat_widget.current_plan_type(),
-            model: Some(self.chat_widget.current_model().to_string()),
+            model: Some(model),
             startup_tooltip_override: None,
             status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
             terminal_title_invalid_items_warned: self.terminal_title_invalid_items_warned.clone(),

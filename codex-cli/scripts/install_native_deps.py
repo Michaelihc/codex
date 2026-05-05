@@ -47,7 +47,7 @@ BINARY_COMPONENTS = {
     "codex": BinaryComponent(
         artifact_prefix="codex",
         dest_dir="codex",
-        binary_basename="codex",
+        binary_basename="codex-multi",
     ),
     "codex-responses-api-proxy": BinaryComponent(
         artifact_prefix="codex-responses-api-proxy",

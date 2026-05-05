@@ -529,6 +529,11 @@ pub(crate) enum AppEvent {
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),
 
+    /// Persist a provider selection and restart the empty thread on that provider.
+    SelectProvider {
+        provider_id: String,
+    },
+
     /// Update the active collaboration mask in the running app and widget.
     UpdateCollaborationMode(CollaborationModeMask),
 

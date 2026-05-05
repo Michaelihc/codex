@@ -2162,7 +2162,6 @@ dependencies = [
  "codex-app-server-test-client",
  "codex-arg0",
  "codex-chatgpt",
- "codex-cloud-tasks",
  "codex-config",
  "codex-core",
  "codex-core-plugins",

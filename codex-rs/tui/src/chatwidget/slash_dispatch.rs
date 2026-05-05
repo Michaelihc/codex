@@ -177,6 +177,9 @@ impl ChatWidget {
             SlashCommand::Model => {
                 self.open_model_popup();
             }
+            SlashCommand::Provider => {
+                self.open_provider_popup();
+            }
             SlashCommand::Fast => {
                 let next_tier = if matches!(self.current_service_tier(), Some(ServiceTier::Fast)) {
                     None
@@ -866,6 +869,7 @@ impl ChatWidget {
             | SlashCommand::Compact
             | SlashCommand::Review
             | SlashCommand::Model
+            | SlashCommand::Provider
             | SlashCommand::Realtime
             | SlashCommand::Settings
             | SlashCommand::Personality

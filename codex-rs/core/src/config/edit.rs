@@ -31,6 +31,8 @@ pub enum ConfigEdit {
         model: Option<String>,
         effort: Option<ReasoningEffort>,
     },
+    /// Update the active (or default) model provider.
+    SetModelProvider { provider: String },
     /// Update the service tier preference for future turns.
     SetServiceTier { service_tier: Option<ServiceTier> },
     /// Update the active (or default) model personality.
@@ -525,6 +527,9 @@ impl ConfigDocument {
                 );
                 mutated
             }),
+            ConfigEdit::SetModelProvider { provider } => {
+                Ok(self.write_profile_value(&["model_provider"], Some(value(provider.clone()))))
+            }
             ConfigEdit::SetServiceTier { service_tier } => Ok(self.write_profile_value(
                 &["service_tier"],
                 service_tier.map(|service_tier| value(service_tier.to_string())),
@@ -1101,6 +1106,13 @@ impl ConfigEditsBuilder {
         self.edits.push(ConfigEdit::SetModel {
             model: model.map(ToOwned::to_owned),
             effort,
+        });
+        self
+    }
+
+    pub fn set_model_provider(mut self, provider: &str) -> Self {
+        self.edits.push(ConfigEdit::SetModelProvider {
+            provider: provider.to_string(),
         });
         self
     }

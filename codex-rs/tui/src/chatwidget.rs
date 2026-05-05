@@ -362,6 +362,7 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_utils_approval_presets::ApprovalPreset;
@@ -2053,16 +2054,37 @@ impl ChatWidget {
         self.config.approvals_reviewer = session.approvals_reviewer;
         self.status_line_project_root_name_cache = None;
         let forked_from_id = session.forked_from_id;
-        let model_for_header = session.model.clone();
+        let use_configured_model =
+            !self.config.model_provider.is_openai() || session.model_provider_id != "openai";
+        let model_for_header = if use_configured_model {
+            self.config
+                .model
+                .clone()
+                .unwrap_or_else(|| self.current_model().to_string())
+        } else {
+            session.model.clone()
+        };
+        let reasoning_effort = if use_configured_model {
+            self.config.model_reasoning_effort
+        } else {
+            session.reasoning_effort
+        };
+        let mut display_session = session.clone();
+        if use_configured_model {
+            display_session.model = model_for_header.clone();
+            display_session.reasoning_effort = reasoning_effort;
+        }
         self.session_header.set_model(&model_for_header);
+        self.config.model = Some(model_for_header.clone());
+        self.config.model_reasoning_effort = reasoning_effort;
         self.current_collaboration_mode = self.current_collaboration_mode.with_updates(
             Some(model_for_header.clone()),
-            Some(session.reasoning_effort),
+            Some(reasoning_effort),
             /*developer_instructions*/ None,
         );
         if let Some(mask) = self.active_collaboration_mask.as_mut() {
             mask.model = Some(model_for_header.clone());
-            mask.reasoning_effort = Some(session.reasoning_effort);
+            mask.reasoning_effort = Some(reasoning_effort);
         }
         self.refresh_model_display();
         self.refresh_status_surfaces();
@@ -2078,7 +2100,7 @@ impl ChatWidget {
             let session_info_cell = history_cell::new_session_info(
                 &self.config,
                 &model_for_header,
-                &session,
+                &display_session,
                 self.show_welcome_banner,
                 startup_tooltip_override,
                 self.plan_type,
@@ -7608,7 +7630,65 @@ impl ChatWidget {
         Some(trimmed.to_string())
     }
 
+    pub(crate) fn can_switch_provider(&self) -> bool {
+        self.visible_user_turn_count == 0 && !self.bottom_pane.is_task_running()
+    }
+
+    pub(crate) fn open_provider_popup(&mut self) {
+        if !self.can_switch_provider() {
+            self.add_error_message(
+                "/provider can only be used before the first turn in a thread. Start a new thread to change providers.".to_string(),
+            );
+            return;
+        }
+
+        let mut providers: Vec<_> = self.config.model_providers.iter().collect();
+        providers.sort_by(|(left_id, _), (right_id, _)| left_id.cmp(right_id));
+
+        let current_provider = self.config.model_provider_id.clone();
+        let items: Vec<SelectionItem> = providers
+            .into_iter()
+            .map(|(provider_id, provider)| {
+                let provider_id_for_action = provider_id.clone();
+                let description = provider
+                    .base_url
+                    .as_ref()
+                    .filter(|base_url| !base_url.trim().is_empty())
+                    .cloned()
+                    .or_else(|| Some(provider.name.clone()));
+                let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                    tx.send(AppEvent::SelectProvider {
+                        provider_id: provider_id_for_action.clone(),
+                    });
+                })];
+                SelectionItem {
+                    name: provider_id.clone(),
+                    description,
+                    is_current: provider_id.as_str() == current_provider.as_str(),
+                    actions,
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Select Provider".to_string()),
+            subtitle: Some(
+                "Provider changes restart the empty thread with isolated config.".to_string(),
+            ),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
     pub(crate) fn open_model_popup_with_presets(&mut self, presets: Vec<ModelPreset>) {
+        if self.config.model_provider_id == "deepseek" {
+            self.open_all_models_popup(Self::deepseek_model_presets());
+            return;
+        }
+
         let presets: Vec<ModelPreset> = presets
             .into_iter()
             .filter(|preset| preset.show_in_picker)
@@ -7795,6 +7875,64 @@ impl ChatWidget {
             items,
             ..Default::default()
         });
+    }
+
+    fn deepseek_model_presets() -> Vec<ModelPreset> {
+        let preset = |model: &str,
+                      display_name: &str,
+                      description: &str,
+                      is_default: bool,
+                      default_reasoning_effort: ReasoningEffortConfig,
+                      supported_reasoning_efforts: Vec<ReasoningEffortPreset>|
+         -> ModelPreset {
+            ModelPreset {
+                id: model.to_string(),
+                model: model.to_string(),
+                display_name: display_name.to_string(),
+                description: description.to_string(),
+                default_reasoning_effort,
+                supported_reasoning_efforts,
+                supports_personality: false,
+                additional_speed_tiers: Vec::new(),
+                is_default,
+                upgrade: None,
+                show_in_picker: true,
+                availability_nux: None,
+                supported_in_api: true,
+                input_modalities: vec![InputModality::Text],
+            }
+        };
+
+        vec![
+            preset(
+                "deepseek-v4-flash",
+                "DeepSeek V4 Flash",
+                "Lower latency and cost.",
+                true,
+                ReasoningEffortConfig::None,
+                vec![ReasoningEffortPreset {
+                    effort: ReasoningEffortConfig::None,
+                    description: "Thinking disabled".to_string(),
+                }],
+            ),
+            preset(
+                "deepseek-v4-pro",
+                "DeepSeek V4 Pro",
+                "Higher quality for harder tasks.",
+                false,
+                ReasoningEffortConfig::High,
+                vec![
+                    ReasoningEffortPreset {
+                        effort: ReasoningEffortConfig::High,
+                        description: "Thinking mode".to_string(),
+                    },
+                    ReasoningEffortPreset {
+                        effort: ReasoningEffortConfig::XHigh,
+                        description: "Maximum thinking mode".to_string(),
+                    },
+                ],
+            ),
+        ]
     }
 
     fn model_selection_actions(
@@ -9180,6 +9318,7 @@ impl ChatWidget {
     /// Does not touch the active Plan mask — Plan reasoning is controlled
     /// exclusively by the Plan preset and `set_plan_mode_reasoning_effort`.
     pub(crate) fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffortConfig>) {
+        self.config.model_reasoning_effort = effort;
         self.current_collaboration_mode = self.current_collaboration_mode.with_updates(
             /*model*/ None,
             Some(effort),
@@ -9285,6 +9424,7 @@ impl ChatWidget {
 
     /// Set the model in the widget's config copy and stored collaboration mode.
     pub(crate) fn set_model(&mut self, model: &str) {
+        self.config.model = Some(model.to_string());
         self.current_collaboration_mode = self.current_collaboration_mode.with_updates(
             Some(model.to_string()),
             /*effort*/ None,

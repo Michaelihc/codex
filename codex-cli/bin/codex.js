@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Unified entry point for the Codex CLI.
+// Unified entry point for the Codex Multi CLI.
 
 import { spawn } from "node:child_process";
 import { existsSync } from "fs";
@@ -13,12 +13,12 @@ const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
 
 const PLATFORM_PACKAGE_BY_TARGET = {
-  "x86_64-unknown-linux-musl": "@openai/codex-linux-x64",
-  "aarch64-unknown-linux-musl": "@openai/codex-linux-arm64",
-  "x86_64-apple-darwin": "@openai/codex-darwin-x64",
-  "aarch64-apple-darwin": "@openai/codex-darwin-arm64",
-  "x86_64-pc-windows-msvc": "@openai/codex-win32-x64",
-  "aarch64-pc-windows-msvc": "@openai/codex-win32-arm64",
+  "x86_64-unknown-linux-musl": "@michaelihc/codex-multi-linux-x64",
+  "aarch64-unknown-linux-musl": "@michaelihc/codex-multi-linux-arm64",
+  "x86_64-apple-darwin": "@michaelihc/codex-multi-darwin-x64",
+  "aarch64-apple-darwin": "@michaelihc/codex-multi-darwin-arm64",
+  "x86_64-pc-windows-msvc": "@michaelihc/codex-multi-win32-x64",
+  "aarch64-pc-windows-msvc": "@michaelihc/codex-multi-win32-arm64",
 };
 
 const { platform, arch } = process;
@@ -75,7 +75,8 @@ if (!platformPackage) {
   throw new Error(`Unsupported target triple: ${targetTriple}`);
 }
 
-const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
+const codexBinaryName =
+  process.platform === "win32" ? "codex-multi.exe" : "codex-multi";
 const localVendorRoot = path.join(__dirname, "..", "vendor");
 const localBinaryPath = path.join(
   localVendorRoot,
@@ -95,8 +96,8 @@ try {
     const packageManager = detectPackageManager();
     const updateCommand =
       packageManager === "bun"
-        ? "bun install -g @openai/codex@latest"
-        : "npm install -g @openai/codex@latest";
+        ? "bun install -g @michaelihc/codex-multi@latest"
+        : "npm install -g @michaelihc/codex-multi@latest";
     throw new Error(
       `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
     );
@@ -107,8 +108,8 @@ if (!vendorRoot) {
   const packageManager = detectPackageManager();
   const updateCommand =
     packageManager === "bun"
-      ? "bun install -g @openai/codex@latest"
-      : "npm install -g @openai/codex@latest";
+      ? "bun install -g @michaelihc/codex-multi@latest"
+      : "npm install -g @michaelihc/codex-multi@latest";
   throw new Error(
     `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
   );

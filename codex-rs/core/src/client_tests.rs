@@ -7,6 +7,7 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
+use crate::client_common::Prompt;
 use codex_api::ApiError;
 use codex_api::ResponseEvent;
 use codex_app_server_protocol::AuthMode;
@@ -15,7 +16,9 @@ use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::InternalSessionSource;
@@ -147,6 +150,44 @@ fn output_message(id: &str, text: &str) -> ResponseItem {
     }
 }
 
+fn input_message(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+    }
+}
+
+fn function_call(call_id: &str, name: &str) -> ResponseItem {
+    ResponseItem::FunctionCall {
+        id: Some(call_id.to_string()),
+        name: name.to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: call_id.to_string(),
+    }
+}
+
+fn function_call_output(call_id: &str, output: &str) -> ResponseItem {
+    ResponseItem::FunctionCallOutput {
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload::from_text(output.to_string()),
+    }
+}
+
+fn prompt_without_instructions(input: Vec<ResponseItem>) -> Prompt {
+    Prompt {
+        input,
+        base_instructions: BaseInstructions {
+            text: String::new(),
+        },
+        ..Prompt::default()
+    }
+}
+
 async fn replay_until_cancelled(temp: &TempDir) -> anyhow::Result<RolloutTrace> {
     let mut rollout = replay_bundle(temp.path())?;
     for _ in 0..50 {
@@ -162,6 +203,63 @@ async fn replay_until_cancelled(temp: &TempDir) -> anyhow::Result<RolloutTrace> 
         rollout = replay_bundle(temp.path())?;
     }
     Ok(rollout)
+}
+
+#[test]
+fn chat_completion_request_groups_consecutive_tool_calls() {
+    let client = test_model_client(SessionSource::Cli);
+    let session = client.new_session();
+    let prompt = prompt_without_instructions(vec![
+        function_call("call_1", "first_tool"),
+        function_call("call_2", "second_tool"),
+        function_call_output("call_2", "second result"),
+        function_call_output("call_1", "first result"),
+        input_message("continue"),
+    ]);
+
+    let (request, _) = session
+        .build_chat_completion_request(&prompt, &test_model_info(), None)
+        .expect("chat request should build");
+
+    assert_eq!(request.messages.len(), 4);
+    let assistant = &request.messages[0];
+    assert_eq!(assistant.role, "assistant");
+    let tool_calls = assistant
+        .tool_calls
+        .as_ref()
+        .expect("assistant message should contain tool calls");
+    assert_eq!(tool_calls.len(), 2);
+    assert_eq!(tool_calls[0].id, "call_1");
+    assert_eq!(tool_calls[1].id, "call_2");
+    assert_eq!(request.messages[1].role, "tool");
+    assert_eq!(request.messages[1].tool_call_id.as_deref(), Some("call_2"));
+    assert_eq!(request.messages[2].role, "tool");
+    assert_eq!(request.messages[2].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(request.messages[3].role, "user");
+}
+
+#[test]
+fn chat_completion_request_synthesizes_missing_tool_outputs_before_next_message() {
+    let client = test_model_client(SessionSource::Cli);
+    let session = client.new_session();
+    let prompt = prompt_without_instructions(vec![
+        function_call("call_1", "first_tool"),
+        input_message("continue"),
+    ]);
+
+    let (request, _) = session
+        .build_chat_completion_request(&prompt, &test_model_info(), None)
+        .expect("chat request should build");
+
+    assert_eq!(request.messages.len(), 3);
+    assert_eq!(request.messages[0].role, "assistant");
+    assert_eq!(request.messages[1].role, "tool");
+    assert_eq!(request.messages[1].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(
+        request.messages[1].content.as_deref(),
+        Some("Tool call did not produce output.")
+    );
+    assert_eq!(request.messages[2].role, "user");
 }
 
 struct NotifyAfterEventStream {
