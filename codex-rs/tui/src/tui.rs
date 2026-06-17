@@ -858,8 +858,17 @@ impl Tui {
             return Ok(());
         }
 
+        // The Standard insertion path pushes finalized rows into native scrollback using DECSTBM
+        // scroll-region margins (`CSI top;bottom r`) plus reverse-index (`ESC M`). Windows consoles
+        // — legacy conhost and current ConPTY builds — do not reliably honor those margins, so the
+        // scroll spills out of band and overwrites already-committed history (openai/codex#15380).
+        // The ZellijRaw path is scroll-region-free (it repaints above the viewport and relies only
+        // on full-screen scrolling), so route Windows through it as well.
+        let scroll_region_unsafe = cfg!(windows);
         for batch in pending_history_lines.iter() {
-            let mode = if is_zellij && batch.wrap_policy == HistoryLineWrapPolicy::Terminal {
+            let use_scroll_region_free = scroll_region_unsafe
+                || (is_zellij && batch.wrap_policy == HistoryLineWrapPolicy::Terminal);
+            let mode = if use_scroll_region_free {
                 InsertHistoryMode::ZellijRaw
             } else {
                 InsertHistoryMode::Standard
