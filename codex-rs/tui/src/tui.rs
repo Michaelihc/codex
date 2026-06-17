@@ -858,8 +858,20 @@ impl Tui {
             return Ok(());
         }
 
+        // Defensive hedge — NOT the primary fix. The root cause of history being overwritten
+        // was a row-count undercount in `insert_history` (wide glyphs and tabs were measured as
+        // fewer rows than the terminal actually uses), now corrected by `wrapped_row_count`. As
+        // added insurance on Windows — where conhost/ConPTY are the least dependable about the
+        // DECSTBM scroll-region margins (`CSI top;bottom r`) + reverse-index (`ESC M`) the
+        // Standard path relies on — also route Windows through the scroll-region-free ZellijRaw
+        // path, which repaints above the viewport using only full-screen scrolling. Harmless if
+        // unnecessary; revisit if a non-Zellij Windows regression appears.
+        // See openai/codex#15380, openai/codex#24849.
+        let scroll_region_unsafe = cfg!(windows);
         for batch in pending_history_lines.iter() {
-            let mode = if is_zellij && batch.wrap_policy == HistoryLineWrapPolicy::Terminal {
+            let use_scroll_region_free = scroll_region_unsafe
+                || (is_zellij && batch.wrap_policy == HistoryLineWrapPolicy::Terminal);
+            let mode = if use_scroll_region_free {
                 InsertHistoryMode::ZellijRaw
             } else {
                 InsertHistoryMode::Standard
