@@ -1063,4 +1063,272 @@ mod tests {
             "expected URL content to appear immediately after prompt (allowing at most one spacer row), got prompt_row={prompt_row}, url_row={url_row}, rows={rows:?}",
         );
     }
+
+    // --- Windows / ConPTY scroll-region regression coverage ---------------------------------
+    //
+    // `VT100Backend` faithfully honors DECSTBM scroll-region margins, which is exactly why the
+    // `Standard` insertion path (which depends on them) looks correct in every other test. The
+    // backend below models a host that IGNORES those margins (legacy conhost / some ConPTY
+    // builds): it strips `CSI <params> r` from the byte stream before delegating to a real
+    // `VT100Backend`, so reverse-index and line feeds act on the whole screen — the conditions
+    // under which finalized history gets overwritten in the field (openai/codex#15380).
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum EscState {
+        Normal,
+        Esc,
+        Csi,
+    }
+
+    struct NoScrollRegionBackend {
+        inner: VT100Backend,
+        state: EscState,
+        csi: Vec<u8>,
+        raw: Vec<u8>,
+    }
+
+    impl NoScrollRegionBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                inner: VT100Backend::new(width, height),
+                state: EscState::Normal,
+                csi: Vec::new(),
+                raw: Vec::new(),
+            }
+        }
+
+        fn vt100(&self) -> &vt100::Parser {
+            self.inner.vt100()
+        }
+
+        /// All bytes written by the caller, before filtering — used to assert which escape
+        /// primitives a path actually emits.
+        fn raw(&self) -> &[u8] {
+            &self.raw
+        }
+
+        fn filter(&mut self, buf: &[u8], out: &mut Vec<u8>) {
+            for &b in buf {
+                match self.state {
+                    EscState::Normal => {
+                        if b == 0x1b {
+                            self.state = EscState::Esc;
+                        } else {
+                            out.push(b);
+                        }
+                    }
+                    EscState::Esc => {
+                        if b == b'[' {
+                            self.state = EscState::Csi;
+                            self.csi.clear();
+                            self.csi.push(0x1b);
+                            self.csi.push(b'[');
+                        } else {
+                            // Non-CSI escape (e.g. reverse index `ESC M`) is preserved, so it
+                            // scrolls the full screen on this margin-ignoring host.
+                            out.push(0x1b);
+                            out.push(b);
+                            self.state = EscState::Normal;
+                        }
+                    }
+                    EscState::Csi => {
+                        self.csi.push(b);
+                        if (0x40..=0x7e).contains(&b) {
+                            // Final byte reached: drop DECSTBM set/reset margins (`...r`).
+                            if b != b'r' {
+                                out.extend_from_slice(&self.csi);
+                            }
+                            self.csi.clear();
+                            self.state = EscState::Normal;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    impl io::Write for NoScrollRegionBackend {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.raw.extend_from_slice(buf);
+            let mut out = Vec::with_capacity(buf.len());
+            self.filter(buf, &mut out);
+            self.inner.write_all(&out)?;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            io::Write::flush(&mut self.inner)
+        }
+    }
+
+    impl Backend for NoScrollRegionBackend {
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content)
+        }
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.inner.hide_cursor()
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.inner.show_cursor()
+        }
+        fn get_cursor_position(&mut self) -> io::Result<ratatui::layout::Position> {
+            self.inner.get_cursor_position()
+        }
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> io::Result<()> {
+            self.inner.set_cursor_position(position)
+        }
+        fn clear(&mut self) -> io::Result<()> {
+            self.inner.clear()
+        }
+        fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> io::Result<()> {
+            self.inner.clear_region(clear_type)
+        }
+        fn append_lines(&mut self, n: u16) -> io::Result<()> {
+            self.inner.append_lines(n)
+        }
+        fn size(&self) -> io::Result<Size> {
+            self.inner.size()
+        }
+        fn window_size(&mut self) -> io::Result<ratatui::backend::WindowSize> {
+            self.inner.window_size()
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Backend::flush(&mut self.inner)
+        }
+        fn scroll_region_up(
+            &mut self,
+            region: std::ops::Range<u16>,
+            scroll_by: u16,
+        ) -> io::Result<()> {
+            // Not exercised by the insert path under test; delegate unchanged.
+            self.inner.scroll_region_up(region, scroll_by)
+        }
+        fn scroll_region_down(
+            &mut self,
+            region: std::ops::Range<u16>,
+            scroll_by: u16,
+        ) -> io::Result<()> {
+            self.inner.scroll_region_down(region, scroll_by)
+        }
+    }
+
+    fn contains_decstbm(bytes: &[u8]) -> bool {
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+                let mut j = i + 2;
+                while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'r' {
+                    return true;
+                }
+                i = j + 1;
+            } else {
+                i += 1;
+            }
+        }
+        false
+    }
+
+    fn contains_reverse_index(bytes: &[u8]) -> bool {
+        bytes.windows(2).any(|w| w == [0x1b, b'M'])
+    }
+
+    /// On a host that ignores scroll-region margins, the scroll-region-free path (the one Codex
+    /// now selects on Windows) keeps finalized history visible above the composer.
+    #[test]
+    fn scroll_region_free_path_preserves_history_on_margin_ignoring_host() {
+        let width: u16 = 20;
+        let height: u16 = 8;
+        let mut term = crate::custom_terminal::Terminal::with_options(
+            NoScrollRegionBackend::new(width, height),
+        )
+        .expect("terminal");
+        // 1-row composer pinned to the bottom — the common inline layout.
+        term.set_viewport_area(Rect::new(0, height - 1, width, 1));
+
+        for i in 0..5 {
+            insert_history_lines_with_mode_and_wrap_policy(
+                &mut term,
+                vec![Line::from(format!("history-line-{i}"))],
+                InsertHistoryMode::ZellijRaw,
+                HistoryLineWrapPolicy::PreWrap,
+            )
+            .expect("insert history");
+        }
+
+        let rows: Vec<String> = term.backend().vt100().screen().rows(0, width).collect();
+        let above: String = rows[..usize::from(term.viewport_area.y)].join("\n");
+        let viewport: String = rows[usize::from(term.viewport_area.y)..].join("\n");
+        assert!(
+            above.contains("history-line-4") && above.contains("history-line-3"),
+            "recent history must stay above the viewport on a margin-ignoring host, rows: {rows:?}"
+        );
+        assert!(
+            !viewport.contains("history-line-4"),
+            "history must not be written through the composer viewport, rows: {rows:?}"
+        );
+    }
+
+    /// Pins the root cause: `Standard` relies on DECSTBM margins (and reverse index when the
+    /// viewport is mid-screen), while the scroll-region-free path emits neither. This is what
+    /// makes the fix portable to hosts that mishandle those margins.
+    #[test]
+    fn standard_emits_scroll_region_primitives_but_free_path_does_not() {
+        let width: u16 = 20;
+        let height: u16 = 8;
+        // Mid-screen viewport so the Standard path also takes its reverse-index branch.
+        let viewport = Rect::new(0, height - 3, width, 1);
+
+        let mut std_term = crate::custom_terminal::Terminal::with_options(
+            NoScrollRegionBackend::new(width, height),
+        )
+        .expect("terminal");
+        std_term.set_viewport_area(viewport);
+        insert_history_lines_with_mode_and_wrap_policy(
+            &mut std_term,
+            vec![Line::from("hello")],
+            InsertHistoryMode::Standard,
+            HistoryLineWrapPolicy::PreWrap,
+        )
+        .expect("standard insert");
+        let std_raw = std_term.backend().raw().to_vec();
+        assert!(
+            contains_decstbm(&std_raw),
+            "Standard path must emit DECSTBM scroll-region margins"
+        );
+        assert!(
+            contains_reverse_index(&std_raw),
+            "Standard path with a mid-screen viewport must emit reverse index"
+        );
+
+        let mut free_term = crate::custom_terminal::Terminal::with_options(
+            NoScrollRegionBackend::new(width, height),
+        )
+        .expect("terminal");
+        free_term.set_viewport_area(viewport);
+        insert_history_lines_with_mode_and_wrap_policy(
+            &mut free_term,
+            vec![Line::from("hello")],
+            InsertHistoryMode::ZellijRaw,
+            HistoryLineWrapPolicy::PreWrap,
+        )
+        .expect("free insert");
+        let free_raw = free_term.backend().raw().to_vec();
+        assert!(
+            !contains_decstbm(&free_raw),
+            "scroll-region-free path must not emit DECSTBM margins"
+        );
+        assert!(
+            !contains_reverse_index(&free_raw),
+            "scroll-region-free path must not emit reverse index"
+        );
+    }
 }
